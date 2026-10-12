@@ -48,14 +48,16 @@ Codex shows both rate-limit windows and the spend limit when available. Display
 formatting matches upstream: no additional spend label, and the existing credits,
 estimated USD, reset-time, and available-reset suffixes are preserved.
 
-Run `/codex-display` to choose interactively in either Pi's terminal UI or the
-Webview, or set the mode directly:
+Run `/spark codex-display` to choose interactively in either Pi's terminal UI or
+the Webview, or set the mode directly:
 
 ```text
-/codex-display both
-/codex-display rate-limits
-/codex-display spend
+/spark codex-display both
+/spark codex-display rate-limits
+/spark codex-display spend
 ```
+
+Run `/spark` to see the command syntax.
 
 The choice is saved and applied to the running status without a reload or a model
 call. It is saved globally unless the workspace already overrides this preference

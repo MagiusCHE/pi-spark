@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import test, { after, beforeEach } from "node:test";
 import { fileURLToPath } from "node:url";
+import { CombinedAutocompleteProvider } from "@earendil-works/pi-tui";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const cache = join(root, ".cache");
@@ -218,9 +219,10 @@ function commandHarness(projectSettings) {
     },
   };
   return {
-    ctx, notifications, statuses, projectPath,
+    ctx, notifications, statuses, projectPath, commands,
     globalPath: join(agentDir, "spark.json"),
-    command: commands.get("codex-display"),
+    command: commands.get("spark"),
+    run: (argument = "") => commands.get("spark").handler(`codex-display${argument ? ` ${argument}` : ""}`, ctx),
     async start() {
       let timeout;
       try {
@@ -247,18 +249,66 @@ function writeSettings(path, settings) {
   writeFileSync(path, JSON.stringify(settings));
 }
 
-test("command is registered without OAuth or a running credits manager, with argument completions", () => {
-  const { command } = commandHarness();
+test("spark is registered without OAuth or a credits manager, replacing the standalone command", () => {
+  const { command, commands } = commandHarness();
   assert.ok(command);
-  assert.deepEqual(command.getArgumentCompletions("").map((item) => item.value), ["both", "rate-limits", "spend"]);
-  assert.deepEqual(command.getArgumentCompletions("rate").map((item) => item.value), ["rate-limits"]);
-  assert.equal(command.getArgumentCompletions("invalid"), null);
+  assert.equal(commands.has("codex-display"), false);
+  assert.deepEqual([...commands.keys()], ["spark"]);
+  assert.deepEqual(command.getArgumentCompletions("").map((item) => item.value), ["codex-display"]);
+  assert.deepEqual(command.getArgumentCompletions("cod").map((item) => item.value), ["codex-display"]);
+  assert.deepEqual(command.getArgumentCompletions("codex-display ").map((item) => item.value), [
+    "codex-display both", "codex-display rate-limits", "codex-display spend",
+  ]);
+  assert.deepEqual(command.getArgumentCompletions("codex-display rate").map((item) => item.value), ["codex-display rate-limits"]);
+  assert.deepEqual(command.getArgumentCompletions("  codex-display\tsp").map((item) => item.value), ["codex-display spend"]);
+  for (const prefix of ["invalid", "codex-display-more ", "codex-display invalid", "codex-display spend extra"]) {
+    assert.equal(command.getArgumentCompletions(prefix), null);
+  }
+});
+
+test("TUI argument completion preserves the spark namespace and the subcommand", async () => {
+  const harness = commandHarness();
+  const provider = new CombinedAutocompleteProvider([
+    { name: "spark", getArgumentCompletions: harness.command.getArgumentCompletions },
+  ], harness.ctx.cwd);
+  const line = "/spark codex-display rate";
+  const suggestions = await provider.getSuggestions([line], 0, line.length, { signal: new AbortController().signal });
+  assert.ok(suggestions);
+  const completed = provider.applyCompletion([line], 0, line.length, suggestions.items[0], suggestions.prefix);
+  assert.deepEqual(completed.lines, ["/spark codex-display rate-limits"]);
+});
+
+test("bare spark shows usage without opening the selector or changing settings", async () => {
+  const harness = commandHarness();
+  harness.ctx.ui.select = async () => assert.fail("unexpected selector");
+  await harness.command.handler("", harness.ctx);
+  assert.equal(harness.notifications.at(-1).type, "info");
+  assert.match(harness.notifications.at(-1).message, /Usage: \/spark codex-display/);
+  assert.equal(existsSync(harness.globalPath), false);
+  assert.deepEqual(harness.statuses, []);
+});
+
+test("spark rejects unknown subcommands and unprefixed modes without changing settings", async () => {
+  const harness = commandHarness();
+  harness.ctx.ui.select = async () => assert.fail("unexpected selector");
+  for (const argument of ["unknown", "spend", "codex-display-more spend", "codex-displayx"]) {
+    await harness.command.handler(argument, harness.ctx);
+    assert.equal(harness.notifications.at(-1).type, "error");
+    assert.match(harness.notifications.at(-1).message, /Usage: \/spark codex-display/);
+    assert.equal(existsSync(harness.globalPath), false);
+  }
+});
+
+test("spark accepts whitespace-separated subcommand arguments", async () => {
+  const harness = commandHarness();
+  await harness.command.handler("  codex-display\t  spend\n", harness.ctx);
+  assert.equal(readSettings(harness.globalPath).credits.codexDisplay, "spend");
 });
 
 for (const mode of ["both", "rate-limits", "spend"]) {
   test(`command persists ${mode} globally without creating a project override`, async () => {
     const harness = commandHarness();
-    await harness.command.handler(mode, harness.ctx);
+    await harness.run(mode);
     assert.equal(readSettings(harness.globalPath).credits.codexDisplay, mode);
     assert.equal(existsSync(harness.projectPath), false);
     assert.equal(harness.notifications.at(-1).type, "info");
@@ -272,7 +322,7 @@ test("command applies every mode immediately to an already running status, witho
     await harness.start();
     assert.match(harness.statuses.at(-1), /5h 27% 7d 4% 100%/);
     for (const mode of ["rate-limits", "spend", "both"]) {
-      await harness.command.handler(mode, harness.ctx);
+      await harness.run(mode);
       const text = harness.statuses.at(-1);
       if (mode !== "spend") assert.match(text, /5h 27% 7d 4%/);
       else assert.doesNotMatch(text, /5h|7d/);
@@ -290,10 +340,10 @@ test("command keeps fallback behavior when the preferred source is absent", asyn
   try {
     await harness.start();
     payload = { rate_limit: usageWindows };
-    await harness.command.handler("spend", harness.ctx);
+    await harness.run("spend");
     assert.match(harness.statuses.at(-1), /5h 27% 7d 4%/);
     payload = { spend_control: spendControl };
-    await harness.command.handler("rate-limits", harness.ctx);
+    await harness.run("rate-limits");
     assert.match(harness.statuses.at(-1), /100% \(0 cr\./);
   } finally {
     harness.stop();
@@ -301,7 +351,7 @@ test("command keeps fallback behavior when the preferred source is absent", asyn
 });
 
 for (const mode of ["rpc", "tui"]) {
-  test(`command without arguments opens a supported ${mode} selector and saves the choice`, async () => {
+  test(`codex-display without a mode opens a supported ${mode} selector and saves the choice`, async () => {
     const harness = commandHarness();
     harness.ctx.mode = mode;
     let title;
@@ -310,7 +360,7 @@ for (const mode of ["rpc", "tui"]) {
       assert.equal(options.length, 3);
       return options.find((option) => option.startsWith("rate-limits"));
     };
-    await harness.command.handler("", harness.ctx);
+    await harness.run();
     assert.match(title, /current: both/);
     assert.equal(readSettings(harness.globalPath).credits.codexDisplay, "rate-limits");
   });
@@ -318,7 +368,7 @@ for (const mode of ["rpc", "tui"]) {
 
 test("canceling the selector changes neither settings nor status", async () => {
   const harness = commandHarness();
-  await harness.command.handler("", harness.ctx);
+  await harness.run();
   assert.equal(existsSync(harness.globalPath), false);
   assert.equal(existsSync(harness.projectPath), false);
   assert.deepEqual(harness.statuses, []);
@@ -329,7 +379,7 @@ test("command rejects invalid arguments without saving or opening a selector", a
   const harness = commandHarness();
   harness.ctx.ui.select = async () => assert.fail("unexpected selector");
   for (const argument of ["unknown", "BOTH", "rate-limits extra"]) {
-    await harness.command.handler(argument, harness.ctx);
+    await harness.run(argument);
     assert.equal(harness.notifications.at(-1).type, "error");
     assert.match(harness.notifications.at(-1).message, /Usage:/);
     assert.equal(existsSync(harness.globalPath), false);
@@ -344,7 +394,7 @@ test("command preserves all unrelated global preferences and unknown fields", as
     anotherPreference: ["retained"],
   };
   writeSettings(harness.globalPath, original);
-  await harness.command.handler("spend", harness.ctx);
+  await harness.run("spend");
   assert.deepEqual(readSettings(harness.globalPath), {
     ...original, credits: { ...original.credits, codexDisplay: "spend" },
   });
@@ -355,7 +405,7 @@ test("command updates an existing project override without touching global prefe
   const harness = commandHarness(project);
   writeSettings(harness.globalPath, { credits: { codexDisplay: "both" }, title: false });
   const originalGlobal = readFileSync(harness.globalPath, "utf8");
-  await harness.command.handler("spend", harness.ctx);
+  await harness.run("spend");
   assert.equal(readFileSync(harness.globalPath, "utf8"), originalGlobal);
   assert.deepEqual(readSettings(harness.projectPath), {
     ...project, credits: { ...project.credits, codexDisplay: "spend" },
@@ -366,7 +416,7 @@ test("command updates an existing project override without touching global prefe
 test("a project file without a display override does not prevent global saving", async () => {
   const harness = commandHarness({ credits: { providers: { deepseek: false } }, footer: false });
   const originalProject = readFileSync(harness.projectPath, "utf8");
-  await harness.command.handler("spend", harness.ctx);
+  await harness.run("spend");
   assert.equal(readSettings(harness.globalPath).credits.codexDisplay, "spend");
   assert.equal(readFileSync(harness.projectPath, "utf8"), originalProject);
 });
@@ -375,7 +425,7 @@ test("command never globally enables credits that were enabled only in a workspa
   const harness = commandHarness({ credits: {} });
   writeSettings(harness.globalPath, { credits: false });
   const originalGlobal = readFileSync(harness.globalPath, "utf8");
-  await harness.command.handler("spend", harness.ctx);
+  await harness.run("spend");
   assert.equal(readFileSync(harness.globalPath, "utf8"), originalGlobal);
   assert.equal(readSettings(harness.projectPath).credits.codexDisplay, "spend");
 });
@@ -384,7 +434,7 @@ test("command preserves malformed global JSON without leaking parser fragments",
   const harness = commandHarness();
   const invalid = '{"unrelatedSetting":"fragment-that-must-not-be-displayed",';
   writeFileSync(harness.globalPath, invalid);
-  await harness.command.handler("spend", harness.ctx);
+  await harness.run("spend");
   assert.equal(readFileSync(harness.globalPath, "utf8"), invalid);
   assert.equal(harness.notifications.at(-1).type, "error");
   assert.doesNotMatch(harness.notifications.at(-1).message, /fragment-that-must-not-be-displayed/);
@@ -397,7 +447,7 @@ test("command refuses malformed project JSON instead of overwriting either confi
   writeFileSync(harness.projectPath, invalid);
   writeSettings(harness.globalPath, { credits: { codexDisplay: "both" } });
   const originalGlobal = readFileSync(harness.globalPath, "utf8");
-  await harness.command.handler("spend", harness.ctx);
+  await harness.run("spend");
   assert.equal(readFileSync(harness.projectPath, "utf8"), invalid);
   assert.equal(readFileSync(harness.globalPath, "utf8"), originalGlobal);
   assert.equal(harness.notifications.at(-1).type, "error");
@@ -408,7 +458,7 @@ test("command refuses invalid root or credits shapes without repairing unrelated
     const harness = commandHarness();
     writeSettings(harness.globalPath, original);
     const text = readFileSync(harness.globalPath, "utf8");
-    await harness.command.handler("spend", harness.ctx);
+    await harness.run("spend");
     assert.equal(readFileSync(harness.globalPath, "utf8"), text);
     assert.equal(harness.notifications.at(-1).type, "error");
   }
@@ -417,7 +467,7 @@ test("command refuses invalid root or credits shapes without repairing unrelated
 test("command respects explicitly disabled credits", async () => {
   const harness = commandHarness({ credits: false });
   const originalProject = readFileSync(harness.projectPath, "utf8");
-  await harness.command.handler("spend", harness.ctx);
+  await harness.run("spend");
   assert.equal(readFileSync(harness.projectPath, "utf8"), originalProject);
   assert.equal(existsSync(harness.globalPath), false);
   assert.equal(harness.notifications.at(-1).type, "warning");
@@ -427,19 +477,19 @@ test("non-UI calls require an explicit argument, but direct modes still work", a
   const harness = commandHarness();
   harness.ctx.hasUI = false;
   harness.ctx.ui.select = async () => assert.fail("non-UI selector");
-  await harness.command.handler("", harness.ctx);
+  await harness.run();
   assert.equal(existsSync(harness.globalPath), false);
-  await harness.command.handler("spend", harness.ctx);
+  await harness.run("spend");
   assert.equal(readSettings(harness.globalPath).credits.codexDisplay, "spend");
 });
 
 test("saved mode survives a new context and is shown as the selector's current choice", async () => {
   const first = commandHarness();
-  await first.command.handler("spend", first.ctx);
+  await first.run("spend");
   const second = commandHarness();
   let title;
   second.ctx.ui.select = async (value) => { title = value; };
-  await second.command.handler("", second.ctx);
+  await second.run();
   assert.match(title, /current: spend/);
 });
 
@@ -449,7 +499,7 @@ test("a persistence failure leaves the running display unchanged", async () => {
     await harness.start();
     const originalStatus = harness.statuses.at(-1);
     mkdirSync(harness.globalPath);
-    await harness.command.handler("spend", harness.ctx);
+    await harness.run("spend");
     assert.equal(harness.notifications.at(-1).type, "error");
     assert.equal(harness.statuses.at(-1), originalStatus);
     assert.equal(statSync(harness.globalPath).isDirectory(), true);
@@ -464,7 +514,7 @@ test("command preserves a symlinked global configuration", { skip: process.platf
   const target = join(harness.ctx.cwd, "linked-spark.json");
   writeSettings(target, { footer: false, credits: { codexDisplay: "both" } });
   symlinkSync(target, harness.globalPath);
-  await harness.command.handler("spend", harness.ctx);
+  await harness.run("spend");
   assert.equal(lstatSync(harness.globalPath).isSymbolicLink(), true);
   assert.deepEqual(readSettings(target), { footer: false, credits: { codexDisplay: "spend" } });
 });

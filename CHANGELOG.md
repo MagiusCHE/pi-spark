@@ -7,8 +7,8 @@
 - Show both Codex rate-limit windows and spend information by default. Add
   `credits.codexDisplay` (`both`, `rate-limits`, or `spend`) with automatic
   fallback when a single-information mode's preferred source is unavailable.
-- Add `/codex-display [both | rate-limits | spend]` with an interactive selector
-  for TUI and RPC/Webview, persistent preferences, and live status refresh.
+- Add `/spark codex-display [both | rate-limits | spend]` with an interactive
+  selector for TUI and RPC/Webview, persistent preferences, and live status refresh.
 - Preserve upstream Codex display formatting and its existing suffixes.
 - Keep available information visible even when the API also reports unlimited
   credits.
